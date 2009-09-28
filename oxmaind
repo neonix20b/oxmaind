@@ -1,0 +1,510 @@
+#!/usr/bin/python
+# coding=UTF-8
+import signal, os, daemon, sys
+import os.path
+sys.path.append('/usr/lib/python2.5/site-packages/')
+sys.path.append('/usr/lib/python2.5/')
+from syslog import *
+import oxstarter
+import MySQLdb
+import pgdb
+import time
+import oxrpcthread
+import threading
+#from twisted.web import xmlrpc, server
+from twisted.internet import reactor
+from twisted.python import threadable
+from DBUtils.PooledDB import PooledDB
+import urllib
+
+(user_id,user_login,user_email,wtf,ftppass,mysqlpass) = (None,None,None,None,None,None)
+
+pause = False
+pause_lock = threading.RLock()
+
+def handler(signum, frame):
+    pass
+	
+openlog("oxmaind")
+oxstarter.starter("oxmaind.pid")
+
+mysql = None
+mysqlc = None
+pgsql = None
+pgsqlc = None
+pool = PooledDB(creator = pgdb, mincached = 3, maxcached = 10, maxconnections = 20, database="master", host="localhost", user="main", password="main")
+def oxconnect():
+	global mysql
+	global mysqlc
+	global pgsql
+	global pgsqlc
+	#mysql connect
+	try:
+	  mysql = MySQLdb.connect(host="localhost", user="oxnull", passwd="oxnull", db="oxnull")
+	  #syslog(LOG_EMERG, "mysql connected.")
+	except MySQLdb.Error, err:
+	  syslog(LOG_EMERG, "exception while connecting to mysql database")
+	  syslog(LOG_EMERG, "Error %d: %s" % (err.args[0], err.args[1]))
+	  exit(1)
+	mysqlc = mysql.cursor()
+	#postgresql connect
+	try:
+	  pgsql = pool.connection()#pgdb.connect(host="127.0.0.1", user="main", password="main", database="master")
+	  #syslog(LOG_EMERG, "mysql connected. postresql connected")
+	except StandardError, err:
+	  syslog(LOG_EMERG, "exception while connecting to postgresql database")
+	  syslog(LOG_EMERG, err.message)
+	  exit(1)
+	pgsqlc = pgsql.cursor()
+	
+def pgpool():
+	ret = pool.connection()#pgdb.connect(host="127.0.0.1", user="main", password="main", database="master")
+	return ret;
+	
+def pgpool_close(conn):
+	conn.close()
+
+def last_update(id):
+	try:
+		localpgsql = pgpool()
+		pgsqlcrpc = localpgsql.cursor()
+		print("SELECT last_access FROM webhosting.domains WHERE id=%s"%(id))
+		pgsqlcrpc.execute("SELECT last_access FROM webhosting.domains WHERE id=%s"%(id))
+		(last_access,) = pgsqlcrpc.fetchone()
+		pgsqlcrpc.close()
+		localpgsql.commit()
+		pgpool_close(localpgsql)
+	except StandardError, err:
+		localpgsql.rollback()
+		syslog(LOG_EMERG, "Get last update ERROR id=%s"%id)
+		syslog(LOG_EMERG, err.message)
+		last_access = "Error"
+	return(last_access)
+
+def reg_domain(domain):
+	params = urllib.urlencode({'action':'domain_create',
+	        'extended_message_lang':'ru',
+	        'debug':'2',
+	        'fail_if_no_money':'1',
+	        'username':'neonix@list.ru',
+	        'password':'gbhjub92',
+	        'domain_name':domain,
+	        'period':'1',
+	        'descr':'oxnull hosting',
+	        'person':'Konstantin A Olkhovskij',
+	        'person_r':'Ольховский Константин Александрович',
+	        'private_person_flag':'1',
+	        'passport':'45 09 233903 выдан отделением по району Дмитровский ОУФМС России по гор. Москве в САО 14.08.2007',
+	        'birth_date':'29.07.1987',
+	        'code':'',
+	        'country':'RU',
+	        'p_addr':'127411 Москва, Яхромская, д1, к.2, кв 79',
+	        'phone':'+7 916 394 89 74',
+	        'fax':'+7 916 394 89 74',
+	        'e_mail':'admin@oxnull.net ',
+	        'ns0':'master.oxnull.net',
+	        'ns1':'slave.oxnull.net'})
+	f = urllib.urlopen("http://www.2domains.ru/reg/api/", params)
+	return f.read()
+
+def get_balance(id):
+	try:
+		localpgsql = pgpool()
+		pgsqlcrpc = localpgsql.cursor()
+		print("SELECT balance FROM webhosting.accounts WHERE id=%s"%(id))
+		pgsqlcrpc.execute("SELECT balance FROM webhosting.accounts WHERE id=%s"%(id))
+		(balance,) = pgsqlcrpc.fetchone()
+		pgsqlcrpc.close()
+		localpgsql.commit()
+		pgpool_close(localpgsql)
+	except StandardError, err:
+		localpgsql.rollback()
+		syslog(LOG_EMERG, "Get balance ERROR id=%s"%id)
+		syslog(LOG_EMERG, err.message)
+		balance = "Error"
+	return(balance)
+
+def add_balance(id,add_balance):
+	try:
+		syslog(LOG_EMERG, "WEBMONEY add %s wmr to id=%s."%(add_balance,id))
+		localpgsql = pgpool()
+		pgsqlcrpc = localpgsql.cursor()
+		print("UPDATE webhosting.accounts SET balance = balance + %s WHERE id = %s"%(add_balance,id))
+		pgsqlcrpc.execute("UPDATE webhosting.accounts SET balance = balance + %s WHERE id = %s"%(add_balance,id))
+		pgsqlcrpc.close()
+		localpgsql.commit()
+		pgpool_close(localpgsql)
+	except StandardError, err:
+		localpgsql.rollback()
+		syslog(LOG_EMERG, "Add balance ERROR id=%s"%id)
+		syslog(LOG_EMERG, err.message)
+		balance = "Error"
+	return(balance)
+	
+def set_status(id,status):
+	try:
+		if id != None:
+			mysqlcrpc = mysql.cursor()
+			mysqlcrpc.execute("UPDATE users SET status = '%s' WHERE id=%s"%(status,id))
+			print("UPDATE users SET status = '%s' WHERE id=%s"%(status,id))
+			mysql.commit()
+			mysqlcrpc.close()
+	except MySQLdb.Error, err:
+		print("Error %d: %s" % (err.args[0], err.args[1]))
+
+def user_quotas(id):
+	try:
+		localpgsql = pgpool()
+		pgsqlcrpc = localpgsql.cursor()
+		print("SELECT disk_current_size,disk_max_size,mysql_current_size,mysql_max_size FROM webhosting.quotas WHERE id=%s"%(id))
+		pgsqlcrpc.execute("SELECT disk_current_size,disk_max_size,mysql_current_size,mysql_max_size FROM webhosting.quotas WHERE id=%s"%(id))
+		(disk_current_size,disk_max_size,mysql_current_size,mysql_max_size) = pgsqlcrpc.fetchone()
+		print(disk_current_size+disk_max_size+mysql_current_size+mysql_max_size)
+		pgsqlcrpc.close()
+		localpgsql.commit()
+		pgpool_close(localpgsql)
+		return (str(disk_current_size),str(disk_max_size),str(mysql_current_size),str(mysql_max_size))
+	except StandardError, err:
+		localpgsql.rollback()
+		syslog(LOG_EMERG, "exception while get qoutas from postresql")
+		syslog(LOG_EMERG, err.message)
+	return True
+			
+def pause_processing(wtf):
+		global pause
+		wtf = bool(wtf)
+		pause_lock.acquire()
+		try:
+			pause = wtf
+		finally:
+			pause_lock.release()
+		syslog(LOG_INFO, "set pause to '%s'" % pause)
+		return True
+
+def service_bridge(wtf, user_id, service_id, quantity):
+		try:
+			localpgsql = pgpool()
+			pgsqlrpc = localpgsql.cursor()
+			if wtf=='service_list':
+				print("SELECT title,id,description,cost FROM webhosting.services")
+				pgsqlrpc.execute("SELECT title,id,description,cost FROM webhosting.services")
+				result = pgsqlrpc.fetchall()
+			if wtf=='service_add':
+				#syslog(LOG_EMERG, "service add user_id=%s AND service_id=%s"%(user_id, service_id))
+				#syslog(LOG_EMERG, "INSERT INTO  webhosting.user_services (user_id, service_id,quantity) VALUES (%s,%s,%s)"%(user_id, service_id,quantity))
+				print("INSERT INTO  webhosting.user_services (user_id, service_id,quantity) VALUES (%s,%s,%s)"%(user_id, service_id,quantity))
+				pgsqlrpc.execute("INSERT INTO  webhosting.user_services (user_id, service_id,quantity) VALUES (%s,%s,%s)"%(user_id, service_id,quantity))
+				result = 'ok'
+			if wtf=='service_del':
+				#syslog(LOG_EMERG, "service del user_id=%s AND service_id=%s"%(user_id, service_id))
+				#syslog(LOG_EMERG, "DELETE FROM webhosting.user_services WHERE user_id=%s AND service_id=%s"%(user_id, service_id))
+				print("DELETE FROM webhosting.user_services WHERE user_id=%s AND service_id=%s"%(user_id, service_id))
+				pgsqlrpc.execute("DELETE FROM webhosting.user_services WHERE user_id=%s AND service_id=%s"%(user_id, service_id))
+				result = 'ok'
+			if wtf=='service_stat':
+				print("SELECT quantity FROM webhosting.user_services WHERE user_id=%s AND service_id=%s"%(user_id, service_id))
+				pgsqlrpc.execute("SELECT quantity FROM webhosting.user_services WHERE user_id=%s AND service_id=%s"%(user_id, service_id))
+				result = pgsqlrpc.fetchone()
+				if result == None: result = '0'
+			pgsqlrpc.close()
+			localpgsql.commit()
+			pgpool_close(localpgsql)
+		except StandardError, err:
+			syslog(LOG_EMERG, "exception while change service switch")
+			syslog(LOG_EMERG, "wtf=%s user_id=%s service_id=%s quantity=%s"%(wtf, user_id, service_id, quantity))
+			syslog(LOG_EMERG, str(err))
+			result = 'err'
+			localpgsql.rollback()
+		return result
+
+def create_account(id):
+	try:
+		localpgsql = pgpool()
+		pgsqlrpc = localpgsql.cursor()
+		print("INSERT INTO  webhosting.accounts (id) VALUES (%s)"%(id))
+		pgsqlrpc.execute("INSERT INTO  webhosting.accounts (id) VALUES (%s)"%(id))
+		localpgsql.commit()
+		pgsqlrpc.close()
+		pgpool_close(localpgsql)
+		print("Create balance OK for id=%s"%id)
+		#syslog(LOG_EMERG, "Create balance OK for id=%s"%id)
+	except StandardError, err:
+		localpgsql.rollback()
+		print("Create balance ERROR id=%s"%id)
+		print(err.message)
+		syslog(LOG_EMERG, "Create balance ERROR id=%s"%id)
+		syslog(LOG_EMERG, err.message)
+	return True
+	
+def queue_size():
+		count = 0
+		try:
+			mysqlcrpc = mysql.cursor()
+			mysqlcrpc.execute("SELECT COUNT(*) FROM users WHERE status='0'")
+			(count,) = mysqlcrpc.fetchone()
+			mysqlcrpc.close()
+		except MySQLdb.Error, err:
+		    #syslog(LOG_ALERT, "exception while estimatimg queue size")
+			syslog(LOG_ALERT, "Error %d: %s" % (err.args[0], err.args[1]))			
+		finally:
+			return count
+
+def accounts_number():
+		total = 0
+		active = 0
+		try:
+			localpgsql = pgpool()
+			mysqlcrpc = mysql.cursor()
+			mysqlcrpc.execute("SELECT COUNT(*) FROM users")
+			(total,) = mysqlcrpc.fetchone()
+			mysqlcrpc.close()
+			pgsqlrpc = localpgsql.cursor()
+			pgsqlrpc.execute("SELECT COUNT(*) FROM webhosting.domains")
+			(active,) = pgsqlrpc.fetchone()
+			pgsqlrpc.close()
+			pgpool_close(localpgsql)
+		except MySQLdb.Error, err:
+			syslog(LOG_ALERT, "error getting accounts number")
+			syslog(LOG_ALERT, "Error %d: %s" % (err.args[0], err.args[1]))
+		except StandardError, err:
+			syslog(LOG_EMERG, "Error: %s" % (err.message))
+		finally:
+			return (total, active)
+
+
+oxserviced_lock  = threading.RLock()
+
+class OxservicedSighupSender(threading.Thread):
+	def __init(self):
+		threading.Thread.__init__(self)
+	def run(self):
+		time.sleep(5)
+		if oxserviced_lock.acquire(False):
+	                try:
+	                        os.system ("killall -1 oxserviced")
+	                finally:
+	                        oxserviced_lock.release()
+
+def oxserviced_reload():
+	OxservicedSighupSender().start()
+
+oxconnect()	
+
+rpc = oxrpcthread.RpcDaemon('89.208.146.80', 1979)
+rpc.export(set_status, "set_status")
+rpc.export(pause_processing,"pause_processing")
+rpc.export(queue_size,"queue_size")
+rpc.export(user_quotas,"user_quotas")
+rpc.export(queue_size,"queue_size")
+rpc.export(accounts_number,"accounts_number")
+rpc.export(service_bridge,"service_bridge")
+rpc.export(oxserviced_reload,"oxserviced_reload")
+rpc.export(get_balance,"get_balance")
+rpc.export(create_account,"create_account")
+rpc.export(add_balance,"add_balance")
+rpc.export(last_update,"last_update")
+rpc.export(reg_domain,"reg_domain")
+
+rpc.start()
+
+#if not os.fork():
+#	oxconnect()	
+#	rpc = OxRpcServer()
+#	reactor.listenTCP(interface='89.208.146.80', port=1979, factory=server.Site(rpc), backlog=50)
+#	threadable.init()
+#	reactor.suggestThreadPoolSize(30)
+#	reactor.run()
+
+i=0
+while True:
+	pause_lock.acquire()
+	try:
+		if pause == True:
+			time.sleep(20)
+			continue
+	finally:
+		pause_lock.release()
+	try:
+		print("SELECT user_id,status FROM tasks ORDER BY id ASC")
+		mysqlc.execute("SELECT user_id,status,id FROM tasks ORDER BY id ASC")
+		mysql.commit()
+		works = mysqlc.fetchall()
+		if works == None: 
+			print("Nothing do")
+			continue
+		for work in works:
+			user_id = work[0]
+			task = work[1]
+			task_id = work[2]
+			print("status=%s"%task)
+			if task=='create' or task=='rebuild':
+				try:
+					print("SELECT id,login,email,wtf,status FROM users WHERE id=%s"%user_id)
+					mysqlc.execute(" SELECT login,email,wtf,status FROM users WHERE id=%s"%user_id)
+					mysql.commit()
+					(user_login,user_email,wtf,ustatus) = mysqlc.fetchone()
+					if ustatus == '1':
+						task=='rebuild'
+					try:
+						if task=='create': create_account(user_id)
+					except StandardError, err:
+						print("Create balance error")
+					set_status(work[0],'1')
+					try:
+						if task=='rebuild':
+							try:
+								print("SELECT webhosting.wipe_user(%s)"%(user_id))
+								pgsqlc.execute("SELECT webhosting.wipe_user(%s)"%(user_id))
+							except StandardError, err:
+								print(err.message)
+						if task=='create':
+							print "SELECT webhosting.create_user(%s, '%s', '%s')\n"%(user_id,user_login,user_email)
+							pgsqlc.execute("SELECT webhosting.create_user(%s, '%s', '%s')"%(user_id,user_login,user_email))
+						(ftppass,) = pgsqlc.fetchone()
+						(mysqlpass,) = pgsqlc.fetchone()
+						print("ftp:"+ftppass+"\nmysql:"+mysqlpass)
+						print("SELECT webhosting.install_soft(%s, '%s', '%s','%s','')"%(user_id,user_login,mysqlpass,wtf)) 
+						pgsqlc.execute("SELECT webhosting.install_soft(%s, '%s', '%s','%s','')"%(user_id,user_login,mysqlpass,wtf))
+						pgsql.commit()
+						print("UPDATE users SET status = '2',mysqlpass='%s',ftppass='%s' WHERE id = %s"%(mysqlpass,ftppass,user_id))
+						mysqlc.execute("UPDATE users SET status = '2',mysqlpass='%s',ftppass='%s' WHERE id = %s"%(mysqlpass,ftppass,user_id))
+						mysqlc.execute("DELETE FROM tasks WHERE id=%s"%task_id )
+						mysql.commit()
+					except StandardError, err: 
+						pgsql.rollback()
+						print err.message
+						print "Error in: SELECT webhosting.create_user(%s, '%s', '%s')"%(user_id,user_login,user_email)
+						print("Error in: SELECT webhosting.install_soft(%s, '%s', '%s','%s','')"%(user_id,user_login,mysqlpass,wtf)) 
+						syslog(LOG_EMERG, "exception while creating user")
+						syslog(LOG_EMERG, "Error in: SELECT webhosting.create_user(%s, '%s', '%s')"%(user_id,user_login,user_email))
+						syslog(LOG_EMERG, "Error in: SELECT webhosting.install_soft(%s, '%s', '%s','%s','')"%(user_id,user_login,mysqlpass,wtf))
+						syslog(LOG_EMERG, err.message)
+				except StandardError, err:
+					mysql.rollback()
+					print err.message
+					syslog(LOG_EMERG, "exception in oxmaind. Work with status=%s"%task)
+					syslog(LOG_EMERG, err.message)
+			if task=='attach_domain' or task=='deattach_domain':
+				try:
+					print("SELECT domain FROM users WHERE id=%s"%user_id)
+					mysqlc.execute("SELECT domain FROM users WHERE id=%s"%user_id)
+					mysql.commit()
+					(domain,) = mysqlc.fetchone()
+					if task=='attach_domain':
+						try:
+							print("SELECT webhosting.attach_domain(%s, '%s')"%(user_id,domain))
+							pgsqlc.execute("SELECT webhosting.attach_domain(%s, '%s')"%(user_id,domain))
+							syslog(LOG_EMERG, "Attached %s to user id=%s"%(domain,user_id))
+						except StandardError, err:
+							mysqlc.execute("UPDATE users SET domain = '' WHERE id = %s"%(user_id))
+							pgsql.rollback()
+							print err.message
+							#syslog(LOG_EMERG, "exception in oxmaind. Work with status=%s"%task)
+							syslog(LOG_EMERG, "Not attached %s to user id=%s"%(domain,user_id))
+							syslog(LOG_EMERG, err.message)
+					if task=='deattach_domain':
+						print("SELECT webhosting.detach_domain(%s)"%(user_id))
+						pgsqlc.execute("SELECT webhosting.detach_domain(%s)"%(user_id))
+					pgsql.commit()
+					mysqlc.execute("DELETE FROM tasks WHERE id=%s"%task_id )
+					mysql.commit()
+				except StandardError, err:
+					mysql.rollback()
+					pgsql.rollback()
+					print err.message
+					syslog(LOG_EMERG, "exception in oxmaind. Work with status=%s"%task)
+					syslog(LOG_EMERG, err.message)
+		time.sleep(15)
+	except StandardError, err:
+		print('main except')
+		print err.message
+		time.sleep(5)
+	
+#-----------------------------------------------------OLD-----------------------------------------------
+while True:
+	pause_lock.acquire()
+	try:
+		if pause == True:
+			time.sleep(20)
+			continue
+	finally:
+		pause_lock.release()
+	try:
+		#print "1"
+		mysql.commit()
+		print("SELECT id,login,email,wtf FROM users WHERE status='0' ORDER BY id ASC")
+		mysqlc.execute(" SELECT id,domain,login,email,wtf FROM users WHERE status='0' ORDER BY id ASC")
+		#print "2"
+		(user_id,user_login,user_email,wtf) = mysqlc.fetchone()
+		#print "3"
+		print(user_id+user_login+user_email+wtf)
+		syslog(LOG_INFO, "creating site for %s with id=%s"%(user_login,user_id))
+	except: 
+		print "none"
+		i=i+1
+		if i>2:
+			try:
+				mysqlc.execute("SELECT id FROM users WHERE status='1' ORDER BY id ASC")
+				(user_id,) = mysqlc.fetchone()
+				set_status(user_id,'0')
+				try:
+					print("SELECT webhosting.remove_user(%s)"%(user_id))
+					pgsqlc.execute("SELECT webhosting.remove_user(%s)"%(user_id))
+					pgsql.commit()
+				except StandardError, err: 
+					set_status(user_id,'0')
+					#pgsql.rollback()
+				i=0
+			except StandardError, err: 
+				set_status(user_id,'0')
+				print err.message
+				i=0
+			try:
+				mysqlc.execute("SELECT id,domain FROM users WHERE status='attach_domain' ORDER BY id ASC")
+				(user_id,domain) = mysqlc.fetchone()
+				print("SELECT webhosting.attach_domain(%s, '%s')"%(user_id,domain))
+				syslog(LOG_INFO, "Try attach domain %s for id=%s"%(domain,user_id))
+				pgsqlc.execute("SELECT webhosting.attach_domain(%s, '%s')"%(user_id,domain))
+				pgsql.commit()
+				set_status(user_id,'2')
+			except StandardError, err: 
+				print err.message
+				i=0
+			try:
+				mysqlc.execute("SELECT id FROM users WHERE status='deattach_domain' ORDER BY id ASC")
+				(user_id,) = mysqlc.fetchone()
+				print("SELECT webhosting.detach_domain(%s)"%(user_id))
+				syslog(LOG_INFO, "Try deattach domain for id=%s"%(user_id))
+				pgsqlc.execute("SELECT webhosting.detach_domain(%s)"%(user_id))
+				pgsql.commit()
+				set_status(user_id,'2')
+			except StandardError, err: 
+				print err.message
+				i=0
+		mysql.commit()
+		time.sleep(10);
+		continue
+	set_status(user_id,'1')
+	
+	try:
+		print "\nSELECT webhosting.create_user(%s, '%s', '%s')\n"%(user_id,user_login,user_email)
+		pgsqlc.execute("SELECT webhosting.create_user(%s, '%s', '%s')"%(user_id,user_login,user_email))
+		(ftppass,) = pgsqlc.fetchone()
+		(mysqlpass,) = pgsqlc.fetchone()
+		print("SELECT webhosting.install_soft(%s, '%s', '%s','%s','')"%(user_id,user_login,mysqlpass,wtf)) 
+		pgsqlc.execute("SELECT webhosting.install_soft(%s, '%s', '%s','%s','')"%(user_id,user_login,mysqlpass,wtf))
+		pgsql.commit()
+		print("UPDATE users SET status = '2',mysqlpass='%s',ftppass='%s' WHERE id = %s"%(mysqlpass,ftppass,user_id))
+		mysqlc.execute("UPDATE users SET status = '2',mysqlpass='%s',ftppass='%s' WHERE id = %s"%(mysqlpass,ftppass,user_id))
+		mysql.commit()
+	except StandardError, err: 
+		#print "scyko error "
+		print err.message
+		print "SELECT webhosting.create_user(%s, '%s', '%s')"%(user_id,user_login,user_email)
+		syslog(LOG_EMERG, "exception while creating user")
+		syslog(LOG_INFO, "SELECT webhosting.create_user(%s, '%s', '%s')"%(user_id,user_login,user_email))
+		syslog(LOG_EMERG, err.message)
+	mysql.commit()
+	pgsql.commit()
+	time.sleep(5)
+

@@ -138,8 +138,8 @@ def add_balance(id,add_balance):
 		localpgsql.rollback()
 		syslog(LOG_EMERG, "Add balance ERROR id=%s"%id)
 		syslog(LOG_EMERG, err.message)
-		balance = "Error"
-	return(balance)
+		add_balance = "Error"
+	return(add_balance)
 	
 def set_status(id,status):
 	try:
@@ -363,8 +363,9 @@ while True:
 						(ftppass,) = pgsqlc.fetchone()
 						(mysqlpass,) = pgsqlc.fetchone()
 						print("ftp:"+ftppass+"\nmysql:"+mysqlpass)
-						print("SELECT webhosting.install_soft(%s, '%s', '%s','%s','')"%(user_id,user_login,mysqlpass,wtf)) 
-						pgsqlc.execute("SELECT webhosting.install_soft(%s, '%s', '%s','%s','')"%(user_id,user_login,mysqlpass,wtf))
+						if wtf!='none':
+							print("SELECT webhosting.install_soft(%s, '%s', '%s','%s','')"%(user_id,user_login,mysqlpass,wtf)) 
+							pgsqlc.execute("SELECT webhosting.install_soft(%s, '%s', '%s','%s','')"%(user_id,user_login,mysqlpass,wtf))
 						pgsql.commit()
 						print("UPDATE users SET status = '2',mysqlpass='%s',ftppass='%s' WHERE id = %s"%(mysqlpass,ftppass,user_id))
 						mysqlc.execute("UPDATE users SET status = '2',mysqlpass='%s',ftppass='%s' WHERE id = %s"%(mysqlpass,ftppass,user_id))
